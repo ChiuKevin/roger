@@ -1,0 +1,153 @@
+stages:
+  - build
+  - test
+  - docker
+  - deploy-test
+  - deploy-prod
+
+variables:
+  DOCKER_HOST: tcp://docker:2375
+  DOCKER_TLS_CERTDIR: ""
+
+build:
+  stage: build
+  only:
+    - test-deploy
+    - dev
+    - main
+  image: php:8.2
+  before_script:
+    - apt-get update && apt-get install -y zip unzip
+    - php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');"
+    - php composer-setup.php --install-dir=/usr/local/bin --filename=composer
+    - php -r "unlink('composer-setup.php');"
+    - pecl install redis
+    - docker-php-ext-enable redis
+    - composer install --no-dev
+  script:
+    - cp .env.example .env
+    - php artisan key:generate
+    - php artisan storage:link
+    - echo yes | php artisan jwt:secret
+    - sed -i 's|^APP_URL=.*$|APP_URL=https://api.roger.vornehk.com|' .env
+    - sed -i 's/^DB_HOST=.*$/DB_HOST=mysql/' .env
+    - sed -i 's/^DB_PASSWORD=.*$/DB_PASSWORD=root/' .env
+    - sed -i 's/^REDIS_HOST=.*$/REDIS_HOST=redis/' .env
+    - sed -i 's/^FILESYSTEM_DISK=.*$/FILESYSTEM_DISK=s3/' .env
+    - sed -i "s|^AWS_ACCESS_KEY_ID=.*$|AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID|" .env
+    - sed -i "s|^AWS_SECRET_ACCESS_KEY=.*$|AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY|" .env
+    - sed -i 's/^AWS_DEFAULT_REGION=.*$/AWS_DEFAULT_REGION=ap-northeast-1/' .env
+    - sed -i 's/^AWS_BUCKET=.*$/AWS_BUCKET=roger-vornehk/' .env
+    - sed -i "s|^EVERY8D_USERNAME=.*$|EVERY8D_USERNAME=$EVERY8D_USERNAME|" .env
+    - sed -i "s|^EVERY8D_PASSWORD=.*$|EVERY8D_PASSWORD=$EVERY8D_PASSWORD|" .env
+    - sed -i "s|^ABO_ORG_CODE=.*$|ABO_ORG_CODE=$ABO_ORG_CODE|" .env
+    - sed -i "s|^ABO_MD5_KEY=.*$|ABO_MD5_KEY=$ABO_MD5_KEY|" .env
+    - sed -i "s|^ECPAY_MERCHANT_ID=.*$|ECPAY_MERCHANT_ID=$ECPAY_MERCHANT_ID|" .env
+    - sed -i "s|^ECPAY_HASH_KEY=.*$|ECPAY_HASH_KEY=$ECPAY_HASH_KEY|" .env
+    - sed -i "s|^ECPAY_HASH_IV=.*$|ECPAY_HASH_IV=$ECPAY_HASH_IV|" .env
+    - sed -i "s|^BBMSL_MERCHANT_ID=.*$|BBMSL_MERCHANT_ID=$BBMSL_MERCHANT_ID|" .env
+    - sed -i "s|^BBMSL_PRIVATE_KEY=.*$|BBMSL_PRIVATE_KEY=$BBMSL_PRIVATE_KEY|" .env
+    - sed -i "s|^BBMSL_PUBLIC_KEY=.*$|BBMSL_PUBLIC_KEY=$BBMSL_PUBLIC_KEY|" .env
+  artifacts:
+    paths:
+      - ./
+
+test:
+  stage: test
+  only:
+    - test-deploy
+    - dev
+    - main
+  image: php:latest
+  script:
+    - echo "Start testing"
+    - echo "Test successfully"
+
+docker:
+  stage: docker
+  only:
+    - test-deploy
+    - dev
+    - main
+  image: docker:24.0.5
+  services:
+    - docker:24.0.5-dind
+  script:
+    - |
+      cat <<'EOF' > Dockerfile
+      FROM php:8.2-cli
+
+      WORKDIR /app
+
+      COPY . .
+
+      COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+
+      RUN apt-get update \
+          && apt-get install -y --no-install-recommends \
+              vim \
+              supervisor \
+          && apt-get clean \
+          && rm -rf /var/lib/apt/lists/* \
+          && pecl install openswoole redis \
+          && docker-php-ext-enable openswoole redis \
+          && docker-php-ext-install -j$(nproc) pdo_mysql pcntl \
+          && php artisan storage:link \
+          && chown -R www-data:www-data /app/storage \
+          && chmod -R 775 /app/storage
+
+      CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
+      EOF
+
+    - docker login -u gitlab-ci-token -p $CI_JOB_TOKEN $CI_REGISTRY
+    - docker build -t $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_NAME .
+    - docker push $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_NAME
+
+deploy-test:
+  stage: deploy-test
+  only:
+    - test-deploy
+    - dev
+    - main
+  image: docker:24.0.5
+  services:
+    - docker:24.0.5-dind
+  before_script:
+    - echo "${SSH_PRIVATE_KEY_TEST}" > /tmp/private_key.pem
+    - chmod 600 /tmp/private_key.pem
+  script:
+    - ssh -i /tmp/private_key.pem -o StrictHostKeyChecking=no ${HOST_USER_TEST}@${HOST_TEST} "
+      sudo docker login -u gitlab-ci-token -p '${CI_JOB_TOKEN}' '${CI_REGISTRY}';
+      sudo docker pull '${CI_REGISTRY_IMAGE}:${CI_COMMIT_REF_NAME}';
+      sudo docker images && sudo docker ps -a;
+      if sudo docker ps -a | grep -q 'roger-api'; then
+      sudo docker stop roger-api && sudo docker rm roger-api;
+      fi;
+      sudo docker run -d --name roger-api --network app -v "./docker/public/storage:/app/storage/app/public" '${CI_REGISTRY_IMAGE}:${CI_COMMIT_REF_NAME}';
+      sudo docker image ls --format '{{.CreatedAt}}\t{{.ID}}' '${CI_REGISTRY_IMAGE}' | sort -r | sed '1,3d' | cut -f2 | xargs -r sudo docker rmi;
+      "
+
+deploy-prod:
+  stage: deploy-prod
+  only:
+    - test-deploy
+    - dev
+    - main
+  when: manual
+  image: docker:24.0.5
+  services:
+    - docker:24.0.5-dind
+  before_script:
+    - echo "${SSH_PRIVATE_KEY_PROD}" > /tmp/private_key.pem
+    - chmod 600 /tmp/private_key.pem
+  script:
+    - ssh -i /tmp/private_key.pem -o StrictHostKeyChecking=no ${HOST_USER_PROD}@${HOST_PROD} "
+      sudo docker login -u gitlab-ci-token -p '${CI_JOB_TOKEN}' '${CI_REGISTRY}';
+      sudo docker pull '${CI_REGISTRY_IMAGE}:${CI_COMMIT_REF_NAME}';
+      sudo docker images && sudo docker ps -a;
+      if sudo docker ps -a | grep -q 'roger-api'; then
+      sudo docker stop roger-api && sudo docker rm roger-api;
+      fi;
+      sudo docker run -d --name roger-api --network app '${CI_REGISTRY_IMAGE}:${CI_COMMIT_REF_NAME}';
+      sudo docker image ls --format '{{.CreatedAt}}\t{{.ID}}' '${CI_REGISTRY_IMAGE}' | sort -r | sed '1,3d' | cut -f2 | xargs -r sudo docker rmi;
+      "
